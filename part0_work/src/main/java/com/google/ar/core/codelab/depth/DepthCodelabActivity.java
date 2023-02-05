@@ -23,6 +23,7 @@ import android.support.v7.app.AppCompatActivity;
 import android.util.Log;
 import android.view.MotionEvent;
 import android.widget.Toast;
+import android.widget.Button;
 import com.google.ar.core.Anchor;
 import com.google.ar.core.ArCoreApk;
 import com.google.ar.core.Camera;
@@ -61,12 +62,14 @@ import javax.microedition.khronos.opengles.GL10;
  */
 public class DepthCodelabActivity extends AppCompatActivity implements GLSurfaceView.Renderer {
   private static final String TAG = DepthCodelabActivity.class.getSimpleName();
-
+  private static final String DEPTH_NOT_AVAILABLE_MESSAGE = "[Depth not supported on this device]";
+  private boolean isDepthSupported;
+  private final DepthTextureHandler depthTexture = new DepthTextureHandler();
   // Rendering. The Renderers are created here, and initialized when the GL surface is created.
   private GLSurfaceView surfaceView;
 
   private boolean installRequested;
-
+  private boolean showDepthMap = false;
   private Session session;
   private final SnackbarHelper messageSnackbarHelper = new SnackbarHelper();
   private DisplayRotationHelper displayRotationHelper;
@@ -106,6 +109,17 @@ public class DepthCodelabActivity extends AppCompatActivity implements GLSurface
     surfaceView.setWillNotDraw(false);
 
     installRequested = false;
+    final Button toggleDepthButton = (Button) findViewById(R.id.toggle_depth_button);
+    toggleDepthButton.setOnClickListener(
+            view -> {
+              if (isDepthSupported) {
+                showDepthMap = !showDepthMap;
+                toggleDepthButton.setText(showDepthMap ? R.string.hide_depth : R.string.show_depth);
+              } else {
+                showDepthMap = false;
+                toggleDepthButton.setText(R.string.depth_not_available);
+              }
+            });
   }
 
   @Override
@@ -133,9 +147,17 @@ public class DepthCodelabActivity extends AppCompatActivity implements GLSurface
 
         // Creates the ARCore session.
         session = new Session(/* context= */ this);
+        Config config = session.getConfig();
+        isDepthSupported = session.isDepthModeSupported(Config.DepthMode.AUTOMATIC);
+        if (isDepthSupported) {
+          config.setDepthMode(Config.DepthMode.AUTOMATIC);
+        } else {
+          config.setDepthMode(Config.DepthMode.DISABLED);
+        }
+        session.configure(config);
 
       } catch (UnavailableArcoreNotInstalledException
-          | UnavailableUserDeclinedInstallationException e) {
+               | UnavailableUserDeclinedInstallationException e) {
         message = "Please install ARCore";
         exception = e;
       } catch (UnavailableApkTooOldException e) {
@@ -189,7 +211,7 @@ public class DepthCodelabActivity extends AppCompatActivity implements GLSurface
   public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
     if (!CameraPermissionHelper.hasCameraPermission(this)) {
       Toast.makeText(this, "Camera permission is needed to run this application",
-          Toast.LENGTH_LONG).show();
+              Toast.LENGTH_LONG).show();
       if (!CameraPermissionHelper.shouldShowRequestPermissionRationale(this)) {
         // Permission denied with checking "Do not ask again".
         CameraPermissionHelper.launchPermissionSettings(this);
@@ -210,8 +232,10 @@ public class DepthCodelabActivity extends AppCompatActivity implements GLSurface
 
     // Prepare the rendering objects. This involves reading shaders, so may throw an IOException.
     try {
+      depthTexture.createOnGlThread();
       // Create the texture and pass it to ARCore session to be filled during update().
       backgroundRenderer.createOnGlThread(/*context=*/ this);
+      backgroundRenderer.createDepthShaders(/*context=*/ this, depthTexture.getDepthTexture());
 
       virtualObject.createOnGlThread(/*context=*/ this, "models/andy.obj", "models/andy.png");
       virtualObject.setMaterialProperties(0.0f, 2.0f, 0.5f, 6.0f);
@@ -245,6 +269,9 @@ public class DepthCodelabActivity extends AppCompatActivity implements GLSurface
       // UpdateMode.BLOCKING (it is by default), this will throttle the rendering to the
       // camera framerate.
       Frame frame = session.update();
+      if (isDepthSupported) {
+        depthTexture.update(frame);
+      }
       Camera camera = frame.getCamera();
 
       // Handle one tap per frame.
@@ -252,14 +279,16 @@ public class DepthCodelabActivity extends AppCompatActivity implements GLSurface
 
       // If frame is ready, render camera preview image to the GL surface.
       backgroundRenderer.draw(frame);
-
+      if (showDepthMap) {
+        backgroundRenderer.drawDepth(frame);
+      }
       // Keep the screen unlocked while tracking, but allow it to lock when tracking stops.
       trackingStateHelper.updateKeepScreenOnFlag(camera.getTrackingState());
 
       // If not tracking, don't draw 3D objects, show tracking failure reason instead.
       if (camera.getTrackingState() == TrackingState.PAUSED) {
         messageSnackbarHelper.showMessage(
-            this, TrackingStateHelper.getTrackingFailureReasonString(camera));
+                this, TrackingStateHelper.getTrackingFailureReasonString(camera));
         return;
       }
 
@@ -283,6 +312,9 @@ public class DepthCodelabActivity extends AppCompatActivity implements GLSurface
         messageToShow = PLANES_FOUND_MESSAGE;
       } else {
         messageToShow = SEARCHING_PLANE_MESSAGE;
+      }
+      if (!isDepthSupported) {
+        messageToShow += "\n" + DEPTH_NOT_AVAILABLE_MESSAGE;
       }
       messageSnackbarHelper.showMessage(this, messageToShow);
 
@@ -318,9 +350,9 @@ public class DepthCodelabActivity extends AppCompatActivity implements GLSurface
         if ((trackable instanceof Plane
                 && ((Plane) trackable).isPoseInPolygon(hit.getHitPose())
                 && (calculateDistanceToPlane(hit.getHitPose(), camera.getPose()) > 0))
-            || (trackable instanceof Point
+                || (trackable instanceof Point
                 && ((Point) trackable).getOrientationMode()
-                    == OrientationMode.ESTIMATED_SURFACE_NORMAL)) {
+                == OrientationMode.ESTIMATED_SURFACE_NORMAL)) {
           // Hits are sorted by depth. Consider only closest hit on a plane or oriented point.
           // Cap the number of objects created. This avoids overloading both the
           // rendering system and ARCore.
@@ -360,7 +392,7 @@ public class DepthCodelabActivity extends AppCompatActivity implements GLSurface
     planePose.getTransformedAxis(1, 1.0f, normal, 0);
     // Compute dot product of plane's normal with vector from camera to plane center.
     return (cameraX - planePose.tx()) * normal[0]
-        + (cameraY - planePose.ty()) * normal[1]
-        + (cameraZ - planePose.tz()) * normal[2];
+            + (cameraY - planePose.ty()) * normal[1]
+            + (cameraZ - planePose.tz()) * normal[2];
   }
 }
